@@ -30,5 +30,8 @@ type InvokeError struct {
 	Err      error
 }
 
-func (e *InvokeError) Error() string { return "" } // TODO
-func (e *InvokeError) Unwrap() error { return nil } // TODO
+func (e *InvokeError) Error() string {
+	return "invoke " + e.Function + ": " + string(e.Reason) + ": " + e.Err.Error()
+}
+
+func (e *InvokeError) Unwrap() error { return e.Err }
