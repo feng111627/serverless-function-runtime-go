@@ -100,12 +100,13 @@ func TestInstanceIdleReclaim(t *testing.T) {
 func TestTimeoutInstanceNotReused(t *testing.T) {
 	rt := New()
 	defer rt.Close()
-	var ids []int
+	// 超时的 handler 仍在后台运行，用 channel 传递实例 ID 保证无数据竞争。
+	idCh := make(chan int, 4)
 	rt.Register("fn", Config{
 		MaxConcurrency: 1,
 		Timeout:        40 * time.Millisecond,
 	}, func(ctx context.Context, env *ExecEnv, req any) (any, error) {
-		ids = append(ids, env.InstanceID)
+		idCh <- env.InstanceID
 		if req == "slow" {
 			time.Sleep(500 * time.Millisecond)
 		}
@@ -117,10 +118,11 @@ func TestTimeoutInstanceNotReused(t *testing.T) {
 		t.Fatalf("期望超时，实际 %v", err)
 	}
 	rt.Invoke(context.Background(), "fn", "fast")
-	if len(ids) != 2 || ids[0] == ids[1] {
-		t.Fatalf("超时实例不应复用，实例序列 %v", ids)
+	first, second := <-idCh, <-idCh
+	if first == second {
+		t.Fatalf("超时实例不应复用，两次调用都落在实例 #%d", first)
 	}
-	t.Logf("用例[超时回收]：超时实例 #%d 被强制回收，下次调用使用新实例 #%d ✓", ids[0], ids[1])
+	t.Logf("用例[超时回收]：超时实例 #%d 被强制回收，下次调用使用新实例 #%d ✓", first, second)
 }
 
 // 业务场景：冷启动 —— 新实例有冷启动延迟，复用实例没有。
