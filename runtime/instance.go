@@ -13,6 +13,7 @@ const (
 	stateIdle                              // 空闲，可接受请求
 	stateBusy                              // 执行中，不可接受新请求
 	stateDraining                          // 回收中，等待当前调用结束后销毁
+	stateQuarantined                       // 隔离中：调用已超时/取消但执行未结束，实例永不再复用
 	stateStopped                           // 已回收，不再接受任何请求
 )
 
@@ -26,6 +27,8 @@ func (s instanceState) String() string {
 		return "busy"
 	case stateDraining:
 		return "draining"
+	case stateQuarantined:
+		return "quarantined"
 	case stateStopped:
 		return "stopped"
 	default:
@@ -104,6 +107,24 @@ func (inst *instance) markDraining() {
 	inst.state.CompareAndSwap(int32(stateBusy), int32(stateDraining))
 }
 
+// markQuarantined 把 busy 实例标记为隔离：调用已被判定超时或终止，
+// 但函数体可能仍在后台执行。隔离实例永远不会回到 idle，
+// 因此同一实例不可能同时跑两次调用，也不会有残留状态污染后续请求。
+// 若实例已进入 draining（运行时关闭流程），则保持 draining，不覆盖关闭语义。
+func (inst *instance) markQuarantined() bool {
+	return inst.state.CompareAndSwap(int32(stateBusy), int32(stateQuarantined))
+}
+
+// quarantineToStopped 隔离实例对应的“僵尸执行”真正结束后，将其销毁。
+// 只有处于 quarantined 状态时生效，返回是否转换成功。
+func (inst *instance) quarantineToStopped() bool {
+	return inst.state.CompareAndSwap(int32(stateQuarantined), int32(stateStopped))
+}
+
 func (inst *instance) isStopped() bool {
 	return instanceState(inst.state.Load()) == stateStopped
+}
+
+func (inst *instance) isQuarantined() bool {
+	return instanceState(inst.state.Load()) == stateQuarantined
 }

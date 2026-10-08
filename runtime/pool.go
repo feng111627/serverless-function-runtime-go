@@ -24,14 +24,17 @@ type queuedRequest struct {
 
 // PoolStats 是实例池的可观测快照。
 type PoolStats struct {
-	Instances   int   // 当前实例数（含执行中与回收中）
-	InFlight    int   // 在途执行数
-	Queued      int   // 积压队列长度
-	ColdStarts  int64 // 累计冷启动次数
-	Executed    int64 // 累计执行完成次数
-	Timeouts    int64 // 累计超时次数
-	Rejected    int64 // 累计因背压被拒绝次数
-	Reclaimed   int64 // 累计回收实例数
+	Instances      int   // 当前实例数（含执行中、隔离中与回收中）
+	InFlight       int   // 在途执行数
+	Queued         int   // 积压队列长度
+	ColdStarts     int64 // 累计冷启动次数
+	Executed       int64 // 累计正常执行完成次数
+	Timeouts       int64 // 累计超时次数
+	Rejected       int64 // 累计因背压被拒绝次数
+	Reclaimed      int64 // 累计回收实例数
+	Quarantined    int64 // 累计被隔离的实例数（超时/终止时执行仍未结束）
+	Replaced       int64 // 累计为自愈隔离槽位而新建的替换实例数
+	QuarantinedNow int   // 当前仍处于隔离中的实例数（僵尸执行尚未结束）
 }
 
 // pool 是单个函数的实例池，负责排队、派发、扩缩容与回收。
@@ -49,11 +52,16 @@ type pool struct {
 	reqSeq  atomic.Uint64
 	instSeq atomic.Uint64
 
-	coldStarts atomic.Int64
-	executed   atomic.Int64
-	timeouts   atomic.Int64
-	rejected   atomic.Int64
-	reclaimed  atomic.Int64
+	coldStarts  atomic.Int64
+	executed    atomic.Int64
+	timeouts    atomic.Int64
+	rejected    atomic.Int64
+	reclaimed   atomic.Int64
+	quarantined atomic.Int64
+	replaced    atomic.Int64
+
+	// quarantinedNow 跟踪当前隔离中的实例数（持 p.mu 维护）。
+	quarantinedNow int
 
 	stopReaper chan struct{}
 	reaperDone chan struct{}
@@ -167,7 +175,10 @@ func (p *pool) execute(inst *instance, req queuedRequest) {
 	req.inv.InstanceID = inst.id
 	req.inv.State = inst.store
 
-	resCh := make(chan invokeResult, 1)
+	// 无缓冲通道：保证只有等本函数真正进入接收分支后，
+	// 函数体 goroutine 才会结束（发送阻塞在被接收之前）。
+	// 据此可以把“已收到结果”与“函数体仍在运行”严格区分开。
+	resCh := make(chan invokeResult)
 	go func() {
 		res, err := p.handler(ctx, req.inv)
 		resCh <- invokeResult{res: res, err: err}
@@ -175,18 +186,78 @@ func (p *pool) execute(inst *instance, req queuedRequest) {
 
 	select {
 	case r := <-resCh:
+		// 函数体在判定窗口内真正结束：实例安全，可正常回收复用。
 		p.finish(inst)
 		p.executed.Add(1)
 		req.result <- r
 	case <-ctx.Done():
-		p.finish(inst)
-		// 区分“函数执行超时”与“调用方主动取消”。
-		if errors.Is(ctx.Err(), context.DeadlineExceeded) && req.ctx.Err() == nil {
-			p.timeouts.Add(1)
-			req.result <- invokeResult{err: ErrTimeout}
-		} else {
-			req.result <- invokeResult{err: req.ctx.Err()}
-		}
+		// 调用已被判定为超时或被终止，而函数体此刻尚未真正结束
+		//（否则 resCh 会先就绪）。即使函数体完全不理会取消，
+		// 实例也必须隔离，绝不释放回可复用池。
+		p.quarantine(inst, req, ctx.Err(), resCh)
+	}
+}
+
+// quarantine 处理一次“判定终止但执行未结束”的调用：
+// 隔离实例、释放并发容量并派发排队请求、向调用方回传可区分的失败原因，
+// 然后等待僵尸执行自然结束（不强制杀 goroutine）后销毁实例并自愈补位。
+func (p *pool) quarantine(inst *instance, req queuedRequest, ctxErr error, resCh <-chan invokeResult) {
+	p.mu.Lock()
+	quarantined := inst.markQuarantined()
+	if quarantined {
+		p.quarantinedNow++
+	}
+	p.inFlight--
+	p.dispatchLocked()
+	p.mu.Unlock()
+
+	if quarantined {
+		p.quarantined.Add(1)
+	}
+
+	// 区分“函数执行超时”与“调用方主动取消”。
+	if errors.Is(ctxErr, context.DeadlineExceeded) && req.ctx.Err() == nil {
+		p.timeouts.Add(1)
+		req.result <- invokeResult{err: ErrTimeout}
+	} else {
+		req.result <- invokeResult{err: req.ctx.Err()}
+	}
+
+	// 等待函数体 goroutine 真正结束。无缓冲通道保证：
+	// 能走到这里，说明 execute 收到的是 ctx.Done() 而非结果，
+	// handler 尚未返回；此后一旦接收成功，僵尸执行即真正结束。
+	// 运行时不强制终止 goroutine（Go 无法安全强杀），
+	// 但隔离保证它在结束前不可能影响任何后续调用。
+	<-resCh
+	p.disposeRunaway(inst)
+}
+
+// disposeRunaway 在僵尸执行真正结束后销毁被隔离的实例并自愈：
+// 删除该实例（其私有 store 随之可被 GC，杜绝残留状态），
+// 只要池未关闭且未达实例上限，立即预热一个替换实例补回容量，
+// 让卡死的调用无法永久拖垮整体可用容量。
+func (p *pool) disposeRunaway(inst *instance) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if _, ok := p.instances[inst]; !ok {
+		return
+	}
+	if !inst.quarantineToStopped() {
+		// 状态异常（理论上不会发生）：不触碰，保持隔离。
+		return
+	}
+	delete(p.instances, inst)
+	p.quarantinedNow--
+	if p.closed {
+		// 关闭流程不做自愈，避免复活实例。
+		return
+	}
+	if len(p.instances) < p.cfg.MaxInstances {
+		repl := p.newInstanceLocked()
+		repl.warm()
+		p.replaced.Add(1)
+		// 替换实例已就位，尝试继续消化积压队列。
+		p.dispatchLocked()
 	}
 }
 
@@ -238,14 +309,17 @@ func (p *pool) stats() PoolStats {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return PoolStats{
-		Instances:  len(p.instances),
-		InFlight:   p.inFlight,
-		Queued:     len(p.queue),
-		ColdStarts: p.coldStarts.Load(),
-		Executed:   p.executed.Load(),
-		Timeouts:   p.timeouts.Load(),
-		Rejected:   p.rejected.Load(),
-		Reclaimed:  p.reclaimed.Load(),
+		Instances:      len(p.instances),
+		InFlight:       p.inFlight,
+		Queued:         len(p.queue),
+		ColdStarts:     p.coldStarts.Load(),
+		Executed:       p.executed.Load(),
+		Timeouts:       p.timeouts.Load(),
+		Rejected:       p.rejected.Load(),
+		Reclaimed:      p.reclaimed.Load(),
+		Quarantined:    p.quarantined.Load(),
+		Replaced:       p.replaced.Load(),
+		QuarantinedNow: p.quarantinedNow,
 	}
 }
 
@@ -269,6 +343,9 @@ func (p *pool) close() {
 			}
 		case stateBusy:
 			inst.markDraining()
+		case stateQuarantined:
+			// 僵尸执行仍可能在跑：保持隔离，不 drain、不释放，
+			// 待其真正结束后由 disposeRunaway 清理（此时 closed=true，不自愈）。
 		}
 	}
 	p.mu.Unlock()
