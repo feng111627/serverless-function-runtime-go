@@ -13,6 +13,7 @@ const (
 	stateIdle                              // 空闲，可接受请求
 	stateBusy                              // 执行中，不可接受新请求
 	stateDraining                          // 回收中，等待当前调用结束后销毁
+	stateQuarantined                       // 已隔离：调用已被判定终止但执行未真正结束，不再接受任何请求
 	stateStopped                           // 已回收，不再接受任何请求
 )
 
@@ -26,6 +27,8 @@ func (s instanceState) String() string {
 		return "busy"
 	case stateDraining:
 		return "draining"
+	case stateQuarantined:
+		return "quarantined"
 	case stateStopped:
 		return "stopped"
 	default:
@@ -102,6 +105,27 @@ func (inst *instance) tryReclaim(idleTimeout time.Duration) bool {
 // markDraining 把 busy 实例标记为回收中，调用结束后由 release 完成销毁。
 func (inst *instance) markDraining() {
 	inst.state.CompareAndSwap(int32(stateBusy), int32(stateDraining))
+}
+
+// markQuarantined 把 busy/draining 实例标记为隔离。
+// 隔离后 tryAcquire 永远失败，实例绝不会再被派发给任何调用，
+// 即使其失控执行仍在后台运行。状态已不在执行轨道上时返回 false。
+func (inst *instance) markQuarantined() bool {
+	for {
+		s := instanceState(inst.state.Load())
+		if s != stateBusy && s != stateDraining {
+			return false
+		}
+		if inst.state.CompareAndSwap(int32(s), int32(stateQuarantined)) {
+			return true
+		}
+	}
+}
+
+// stop 强制销毁实例。仅用于隔离实例在其失控执行真正结束后收尾，
+// 或运行时已关闭的清理路径。
+func (inst *instance) stop() {
+	inst.state.Store(int32(stateStopped))
 }
 
 func (inst *instance) isStopped() bool {

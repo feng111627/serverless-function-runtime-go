@@ -24,14 +24,17 @@ type queuedRequest struct {
 
 // PoolStats 是实例池的可观测快照。
 type PoolStats struct {
-	Instances   int   // 当前实例数（含执行中与回收中）
-	InFlight    int   // 在途执行数
-	Queued      int   // 积压队列长度
-	ColdStarts  int64 // 累计冷启动次数
-	Executed    int64 // 累计执行完成次数
-	Timeouts    int64 // 累计超时次数
-	Rejected    int64 // 累计因背压被拒绝次数
-	Reclaimed   int64 // 累计回收实例数
+	Instances      int   // 当前实例数（含执行中与回收中，不含已隔离）
+	InFlight       int   // 在途执行数
+	Queued         int   // 积压队列长度
+	QuarantinedNow int   // 当前隔离中（失控执行仍未真正结束）的实例数
+	ColdStarts     int64 // 累计冷启动次数
+	Executed       int64 // 累计执行完成次数
+	Timeouts       int64 // 累计超时次数
+	Rejected       int64 // 累计因背压被拒绝次数
+	Reclaimed      int64 // 累计回收实例数
+	Quarantined    int64 // 累计被隔离的实例数
+	Replaced       int64 // 累计自愈补位（替换隔离实例）的实例数
 }
 
 // pool 是单个函数的实例池，负责排队、派发、扩缩容与回收。
@@ -40,20 +43,23 @@ type pool struct {
 	cfg     FunctionConfig
 	handler Handler
 
-	mu        sync.Mutex
-	instances map[*instance]struct{}
-	queue     []queuedRequest
-	inFlight  int
-	closed    bool
+	mu          sync.Mutex
+	instances   map[*instance]struct{}
+	quarantined map[*instance]struct{} // 隔离中的实例：失控执行未真正结束，不计入可用容量
+	queue       []queuedRequest
+	inFlight    int
+	closed      bool
 
 	reqSeq  atomic.Uint64
 	instSeq atomic.Uint64
 
-	coldStarts atomic.Int64
-	executed   atomic.Int64
-	timeouts   atomic.Int64
-	rejected   atomic.Int64
-	reclaimed  atomic.Int64
+	coldStarts       atomic.Int64
+	executed         atomic.Int64
+	timeouts         atomic.Int64
+	rejected         atomic.Int64
+	reclaimed        atomic.Int64
+	quarantinedTotal atomic.Int64
+	replaced         atomic.Int64
 
 	stopReaper chan struct{}
 	reaperDone chan struct{}
@@ -61,12 +67,13 @@ type pool struct {
 
 func newPool(name string, cfg FunctionConfig, h Handler) *pool {
 	p := &pool{
-		name:       name,
-		cfg:        cfg,
-		handler:    h,
-		instances:  make(map[*instance]struct{}),
-		stopReaper: make(chan struct{}),
-		reaperDone: make(chan struct{}),
+		name:        name,
+		cfg:         cfg,
+		handler:     h,
+		instances:   make(map[*instance]struct{}),
+		quarantined: make(map[*instance]struct{}),
+		stopReaper:  make(chan struct{}),
+		reaperDone:  make(chan struct{}),
 	}
 	// 常驻下限：预热 MinInstances 个实例。
 	for i := 0; i < cfg.MinInstances; i++ {
@@ -179,7 +186,8 @@ func (p *pool) execute(inst *instance, req queuedRequest) {
 		p.executed.Add(1)
 		req.result <- r
 	case <-ctx.Done():
-		p.finish(inst)
+		// 调用被判定超时/终止：先答复调用方并释放并发配额，
+		// 但实例是否可复用取决于函数体是否真正退出，异步处置。
 		// 区分“函数执行超时”与“调用方主动取消”。
 		if errors.Is(ctx.Err(), context.DeadlineExceeded) && req.ctx.Err() == nil {
 			p.timeouts.Add(1)
@@ -187,7 +195,64 @@ func (p *pool) execute(inst *instance, req queuedRequest) {
 		} else {
 			req.result <- invokeResult{err: req.ctx.Err()}
 		}
+		p.mu.Lock()
+		p.inFlight--
+		p.dispatchLocked()
+		p.mu.Unlock()
+		go p.settleTerminated(inst, resCh)
 	}
+}
+
+// settleTerminated 处置被终止调用占用的实例：
+// 宽限期内函数体真正退出，实例干净，正常释放回池复用；
+// 宽限期过后仍未退出，判定为失控执行，隔离实例并自愈补位。
+// 无论哪条路径，实例在函数体真正退出前都不会回到 idle，
+// 因此绝不会出现同一实例同时跑两次调用。
+func (p *pool) settleTerminated(inst *instance, resCh chan invokeResult) {
+	timer := time.NewTimer(p.cfg.TerminationGrace)
+	defer timer.Stop()
+	select {
+	case <-resCh:
+		// 函数体在宽限期内退出：实例无残留执行，正常回收。
+		inst.release()
+		p.mu.Lock()
+		p.dispatchLocked()
+		p.mu.Unlock()
+	case <-timer.C:
+		p.quarantine(inst, resCh)
+	}
+}
+
+// quarantine 隔离失控实例：从可用容量中移除并标记为隔离，
+// 在实例上限内补位一个健康实例（自愈），尽量派发排队请求；
+// 随后等待失控执行真正结束后销毁实例，隔离计数回落。
+// 隔离实例的 store 随实例销毁，残留执行不会污染后续任何调用。
+func (p *pool) quarantine(inst *instance, resCh chan invokeResult) {
+	p.mu.Lock()
+	if !inst.markQuarantined() {
+		// 实例已不在执行轨道上（如池关闭时已停止），无需隔离。
+		p.mu.Unlock()
+		return
+	}
+	delete(p.instances, inst)
+	p.quarantined[inst] = struct{}{}
+	p.quarantinedTotal.Add(1)
+	// 自愈：隔离实例不再算作可用容量，在上限内补回一个健康实例。
+	if !p.closed && len(p.instances) < p.cfg.MaxInstances {
+		repl := p.newInstanceLocked()
+		repl.warm()
+		p.replaced.Add(1)
+	}
+	p.dispatchLocked()
+	p.mu.Unlock()
+
+	// 失控执行真正结束后销毁实例。函数体若永不退出，
+	// 该实例保持隔离状态，不会泄漏回可用容量。
+	<-resCh
+	inst.stop()
+	p.mu.Lock()
+	delete(p.quarantined, inst)
+	p.mu.Unlock()
 }
 
 // finish 回收一次执行的容量并触发后续派发。
@@ -238,14 +303,17 @@ func (p *pool) stats() PoolStats {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return PoolStats{
-		Instances:  len(p.instances),
-		InFlight:   p.inFlight,
-		Queued:     len(p.queue),
-		ColdStarts: p.coldStarts.Load(),
-		Executed:   p.executed.Load(),
-		Timeouts:   p.timeouts.Load(),
-		Rejected:   p.rejected.Load(),
-		Reclaimed:  p.reclaimed.Load(),
+		Instances:      len(p.instances),
+		InFlight:       p.inFlight,
+		Queued:         len(p.queue),
+		QuarantinedNow: len(p.quarantined),
+		ColdStarts:     p.coldStarts.Load(),
+		Executed:       p.executed.Load(),
+		Timeouts:       p.timeouts.Load(),
+		Rejected:       p.rejected.Load(),
+		Reclaimed:      p.reclaimed.Load(),
+		Quarantined:    p.quarantinedTotal.Load(),
+		Replaced:       p.replaced.Load(),
 	}
 }
 

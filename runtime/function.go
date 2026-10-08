@@ -38,14 +38,20 @@ type FunctionConfig struct {
 	// IdleTimeout 实例空闲超过该时长后被回收（缩容）。
 	// <= 0 时取默认值 30s。
 	IdleTimeout time.Duration
+	// TerminationGrace 调用被判定超时/终止后，等待函数体真正退出的宽限期。
+	// 宽限期内函数体退出，实例正常回收复用；宽限期过后仍未退出，
+	// 判定为失控执行，实例被隔离（不再复用）并由运行时补位自愈。
+	// <= 0 时取默认值 100ms。
+	TerminationGrace time.Duration
 }
 
 const (
-	defaultMaxConcurrency = 4
-	defaultTimeout        = 5 * time.Second
-	defaultMaxQueue       = 64
-	defaultMaxInstances   = 16
-	defaultIdleTimeout    = 30 * time.Second
+	defaultMaxConcurrency   = 4
+	defaultTimeout          = 5 * time.Second
+	defaultMaxQueue         = 64
+	defaultMaxInstances     = 16
+	defaultIdleTimeout      = 30 * time.Second
+	defaultTerminationGrace = 100 * time.Millisecond
 )
 
 // withDefaults 返回填充默认值后的配置副本。
@@ -68,6 +74,9 @@ func (c *FunctionConfig) withDefaults() FunctionConfig {
 	}
 	if out.IdleTimeout <= 0 {
 		out.IdleTimeout = defaultIdleTimeout
+	}
+	if out.TerminationGrace <= 0 {
+		out.TerminationGrace = defaultTerminationGrace
 	}
 	// 实例上限至少要能容纳并发上限，否则并发上限永远无法达到。
 	if out.MaxInstances < out.MaxConcurrency {
